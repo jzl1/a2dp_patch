@@ -55,6 +55,24 @@ $HASH_LEN = $HASH_HI - $HASH_LO
 $GATE_OFF = 0x8AFB3            # AAC watermark gate
 $GATE_OLD = [byte[]](0x44, 0x38)
 $GATE_NEW = [byte[]](0xEB, 0x49)
+
+# Expired-trial gate.
+#
+# sub_14008DA18 branches on the paid verdict (n7 = sub_14007942C):
+#     n7 == 6  -> FA8 = 1, FA9 = (trial == 6)
+#     n7 == 7  -> FA8 = 1, FAA = 1      <- the fully licensed branch
+#     n7 == 0  -> FA8 = 1, FA9 = 1  (only if trial == 6)
+#
+# The evaluator NEVER returns 0 - its returns are 1, 3, 4, 6, 7. So the
+# n7 == 0 branch is dead code, and on a machine with an expired trial and no
+# paid licence n7 == 1, which matches NO branch: FA8, FA9 and FAA all stay 0.
+# The AAC encoder then skips sub_14008AE94 at 0x14008C19A and produces no audio.
+#
+# Force the n7 == 7 branch (FA8 = 1, FAA = 1 - the licensed state) by replacing
+# the `jne` at 0x14008DB0B with a `jmp`. EB 27 lands on 0x14008DB0D.
+$EXP_OFF = 0x8CEE1             # VA 0x14008DAE1: 83 F8 06 75 22 (cmp eax,6 / jne +0x22)
+$EXP_OLD = [byte[]](0x83, 0xF8, 0x06, 0x75, 0x22)
+$EXP_NEW = [byte[]](0x83, 0xF8, 0x06, 0xEB, 0x27)
 $LEA1_VA  = 0x1400740F5        # lea rdx,[rip+d] -> hash start
 $LEA2_VA  = 0x1400740FC        # lea r8, [rip+d] -> hash end
 $VA_BASE  = 0x140000000
@@ -134,14 +152,17 @@ function Test-StockImage([string]$path) {
         $b = [IO.File]::ReadAllBytes($path)
         if ($b.Length -lt 0x1000) { return $false }
         if ((Get-SectionCount $b) -ne 8) { return $false }
-        return ($b[0x8AFB3] -eq 0x44 -and $b[0x8AFB4] -eq 0x38)
+        return ($b[0x8AFB3] -eq 0x44 -and $b[0x8AFB4] -eq 0x38 -and
+                $b[0x8CEE1] -eq 0x83 -and $b[0x8CEE2] -eq 0xF8 -and $b[0x8CEE3] -eq 0x06 -and
+                $b[0x8CEE4] -eq 0x75 -and $b[0x8CEE5] -eq 0x22)
     } catch { return $false }
 }
 
 if ($InSys) {
     if (-not (Test-Path -LiteralPath $InSys)) { throw "input not found: $InSys" }
     $img = [IO.File]::ReadAllBytes($InSys)
-    if ((Get-SectionCount $img) -eq 9 -or ($img[0x8AFB3] -eq 0xEB -and $img[0x8AFB4] -eq 0x49)) {
+    if ((Get-SectionCount $img) -eq 9 -or ($img[0x8AFB3] -eq 0xEB -and $img[0x8AFB4] -eq 0x49) -or
+        ($img[0x8CEE4] -eq 0xEB -and $img[0x8CEE5] -eq 0x27)) {
         throw "$InSys is ALREADY the patched (hashfix) build - patching it again would corrupt it."
     }
     Write-Host "input : $InSys"
@@ -203,6 +224,11 @@ if ($nsec -ne 8) { throw "expected 8 sections, found $nsec - already patched?" }
 if ($img[$GATE_OFF] -ne $GATE_OLD[0] -or $img[$GATE_OFF + 1] -ne $GATE_OLD[1]) {
     throw ('gate bytes at 0x{0:X} are {1:X2} {2:X2}, expected 44 38' -f $GATE_OFF, $img[$GATE_OFF], $img[$GATE_OFF + 1])
 }
+$expGot = ($img[$EXP_OFF..($EXP_OFF + 4)] | ForEach-Object { $_.ToString('X2') }) -join ' '
+$expWant = ($EXP_OLD | ForEach-Object { $_.ToString('X2') }) -join ' '
+if ($expGot -ne $expWant) {
+    throw ('expired-trial gate at 0x{0:X} is {1}, expected {2}' -f $EXP_OFF, $expGot, $expWant)
+}
 Write-Host ("        {0} bytes, {1} sections, cert at 0x{2:X}" -f $img.Length, $nsec, $certOff)
 
 # 1. snapshot the original hashed bytes
@@ -258,6 +284,9 @@ Set-I32 $out ($o2 + 3) ($copyEndVa - ($LEA2_VA + 7))
 $out[$GATE_OFF]     = $GATE_NEW[0]
 $out[$GATE_OFF + 1] = $GATE_NEW[1]
 
+# 5b. expired-trial gate: force the n7 == 7 branch (FA8 = 1, FAA = 1)
+for ($i = 0; $i -lt $EXP_NEW.Length; $i++) { $out[$EXP_OFF + $i] = $EXP_NEW[$i] }
+
 # 6. refresh the PE header checksum
 $cksum = Set-PeChecksum $out
 
@@ -268,6 +297,7 @@ Write-Host ''
 Write-Host ("patched: {0}" -f $patched)
 Write-Host ("  {0} bytes, {1} sections, .origtx VA 0x{2:X}" -f $out.Length, ($nsec + 1), $newVa)
 Write-Host ("  gate 0x{0:X}: 44 38 -> EB 49" -f $GATE_OFF)
+Write-Host ("  expired-trial gate 0x{0:X}: 75 22 -> EB 27 (forces licensed branch: 0xFA8=1, 0xFAA=1)" -f $EXP_OFF)
 Write-Host ("  PE checksum recomputed: 0x{0:X8}" -f $cksum)
 
 if ($PatchOnly) { Write-Host 'patch-only, stopping.'; exit 0 }
@@ -357,7 +387,11 @@ New-Item -ItemType Directory -Force -Path $catDir | Out-Null
 Copy-Item $patched (Join-Path $catDir 'AltA2DP.sys') -Force
 Copy-Item (Join-Path $OutDir 'AltA2DP.inf') (Join-Path $catDir 'AltA2DP.inf') -Force
 $cat = Join-Path $catDir 'AltA2DP.cat'
+if (Test-Path -LiteralPath $cat) { Remove-Item -LiteralPath $cat -Force }
 New-FileCatalog -Path $catDir -CatalogFilePath $cat -CatalogVersion 2 | Out-Null
+if (-not (Test-Path -LiteralPath $cat) -or (Get-Item -LiteralPath $cat).Length -eq 0) {
+    throw 'New-FileCatalog produced no catalog'
+}
 Set-AuthenticodeSignature -FilePath $cat -Certificate $cert -HashAlgorithm SHA256 | Out-Null
 if ((Get-AuthenticodeSignature $cat).Status -ne 'Valid') { throw 'catalog signing failed' }
 Copy-Item $cat (Join-Path $OutDir 'AltA2DP.cat') -Force
@@ -365,39 +399,136 @@ Write-Host 'signed: catalog OK'
 
 # ---------------------------------------------------------------- install
 if ($Install) {
-    $dirs = 'C:\Program Files\Luculent Systems\AltA2DP\Driver',
-            'C:\Windows\System32\DriverStore\FileRepository'
+    # Overwriting DriverStore\FileRepository\*\AltA2DP.sys in place does NOT
+    # work: those files are TrustedInstaller-owned and the running package keeps
+    # its catalog binding. Instead we stage a *new* driver package whose
+    # DriverVer is strictly higher than anything installed, then let pnputil
+    # bind the device to it.
 
-    $targets = @()
-    foreach ($d in $dirs) {
-        if (Test-Path -LiteralPath $d) {
-            $targets += Get-ChildItem -LiteralPath $d -Recurse -Filter 'AltA2DP.sys' -File -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty FullName
+    # 1. bump DriverVer so Windows ranks this package above EVERY installed one.
+    #    Installed versions can be arbitrary (e.g. 1.8.3.90), so scan them all
+    #    and go one above the highest - not just +1 on the INF's own value.
+    $infTxt = Get-Content -LiteralPath (Join-Path $OutDir 'AltA2DP.inf') -Raw
+    $m = [regex]::Match($infTxt, '(?m)^\s*DriverVer\s*=\s*(.+)$')
+    if (-not $m.Success) { throw 'AltA2DP.inf has no DriverVer line' }
+    $oldVer = $m.Groups[1].Value.Trim()
+
+    $installed = @()
+    foreach ($d in Get-ChildItem 'C:\Windows\System32\DriverStore\FileRepository' -Directory -Filter 'alta2dp.inf_amd64_*' -ErrorAction SilentlyContinue) {
+        $i = Join-Path $d.FullName 'AltA2DP.inf'
+        if (Test-Path -LiteralPath $i) {
+            $mm = [regex]::Match((Get-Content -LiteralPath $i -Raw), '(?m)^\s*DriverVer\s*=\s*(.+)$')
+            if ($mm.Success) { $installed += $mm.Groups[1].Value.Trim() }
         }
     }
-    $targets = $targets | Select-Object -Unique
-    if (-not $targets) { throw 'no installed AltA2DP.sys found - install the vendor driver first' }
-
-    foreach ($t in $targets) {
-        if (-not (Test-Path -LiteralPath "$t.orig")) {
-            Copy-Item -LiteralPath $t -Destination "$t.orig" -Force
-            Write-Host "backup: $t.orig"
+    $bestDate = [datetime]::MinValue
+    $bestVer  = [version]'0.0.0.0'
+    foreach ($dv in (@($oldVer) + $installed)) {
+        $p = $dv -split ','
+        $d = [datetime]::ParseExact($p[0].Trim(), 'MM/dd/yyyy', $null)
+        $v = [version]($p[1].Trim())
+        if ($d -gt $bestDate -or ($d -eq $bestDate -and $v -gt $bestVer)) {
+            $bestDate = $d
+            $bestVer  = $v
         }
-        takeown /f "$t" | Out-Null
-        icacls "$t" /grant '*S-1-5-32-544:F' | Out-Null
-        Copy-Item -LiteralPath $patched -Destination $t -Force
-        $td = Split-Path -Parent $t
-        Copy-Item -LiteralPath (Join-Path $OutDir 'AltA2DP.cat') -Destination (Join-Path $td 'AltA2DP.cat') -Force
-        Copy-Item -LiteralPath (Join-Path $OutDir 'AltA2DP.inf') -Destination (Join-Path $td 'AltA2DP.inf') -Force
-        Write-Host "patched: $t"
+    }
+    # go one above the highest installed (date AND version)
+    $newDate = (Get-Date).Date
+    if ($newDate -le $bestDate) { $newDate = $bestDate.AddDays(1) }
+    $newVer = ($newDate.ToString('MM/dd/yyyy')) + ',' + $bestVer.Major + '.' + $bestVer.Minor + '.' + ($bestVer.Build + 1) + '.' + $bestVer.Revision
+    $infTxt = [regex]::Replace($infTxt, '(?m)^(\s*DriverVer\s*=\s*).*$', ('${1}' + $newVer))
+    Write-Host "inf   : DriverVer $oldVer -> $newVer  (installed: $($installed -join ' | '))"
+
+    # 2. build the staged package (INF change invalidates the old catalog)
+    $stage = Join-Path $OutDir 'stage'
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    Copy-Item -LiteralPath $patched -Destination (Join-Path $stage 'AltA2DP.sys') -Force
+    Set-Content -LiteralPath (Join-Path $stage 'AltA2DP.inf') -Value $infTxt -Encoding ascii
+    $stageCat = Join-Path $stage 'AltA2DP.cat'
+    if (Test-Path -LiteralPath $stageCat) { Remove-Item -LiteralPath $stageCat -Force }
+    New-FileCatalog -Path $stage -CatalogFilePath $stageCat -CatalogVersion 2 | Out-Null
+    if (-not (Test-Path -LiteralPath $stageCat) -or (Get-Item -LiteralPath $stageCat).Length -eq 0) {
+        throw 'New-FileCatalog produced no catalog for the staged package'
+    }
+    Set-AuthenticodeSignature -FilePath $stageCat -Certificate $cert -HashAlgorithm SHA256 | Out-Null
+    if ((Get-AuthenticodeSignature $stageCat).Status -ne 'Valid') { throw 'staged catalog signing failed' }
+
+    # 3. register + install the staged package
+    & pnputil.exe /add-driver (Join-Path $stage 'AltA2DP.inf') /install
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0 -and $rc -ne 3010) { throw "pnputil /add-driver failed (exit $rc)" }
+
+    # 4. ALSO replace the copy the service is currently bound to, in place.
+    #    A brand-new package only takes effect once the device re-enumerates;
+    #    an already-installed (but disconnected) headset keeps the old binding.
+    #    Overwriting the bound file + its catalog/inf makes the next load use
+    #    the patched image regardless of driver ranking.
+    $bound = $null
+    $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\AltA2DP'
+    if (Test-Path $svcKey) {
+        $img = (Get-ItemProperty $svcKey -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+        if ($img) {
+            $rel = $img -replace '^\\SystemRoot\\', "$env:SystemRoot\"
+            if (Test-Path -LiteralPath $rel) { $bound = $rel }
+        }
+    }
+    if ($bound) {
+        $bd = Split-Path -Parent $bound
+        Write-Host "bound : $bound"
+        try {
+            # DriverStore is TrustedInstaller-owned; take ownership of the whole
+            # package directory (a new .orig/.cat also needs dir write access).
+            & takeown.exe /f $bd /r /d y 2>&1 | Out-Null
+            & icacls.exe $bd /grant '*S-1-5-32-544:(OI)(CI)F' /t 2>&1 | Out-Null
+            if (-not (Test-Path -LiteralPath "$bound.orig")) {
+                try { Copy-Item -LiteralPath $bound -Destination "$bound.orig" -Force -ErrorAction Stop }
+                catch { Write-Host "note: backup skipped ($($_.Exception.Message))" }
+            }
+            Copy-Item -LiteralPath $patched -Destination $bound -Force -ErrorAction Stop
+            # the package must stay coherent: same-name .cat/.inf covering the new .sys
+            foreach ($pair in @(@((Join-Path $stage 'AltA2DP.cat'), 'AltA2DP.cat'),
+                                 @((Join-Path $stage 'AltA2DP.inf'), 'AltA2DP.inf'))) {
+                try { Copy-Item -LiteralPath $pair[0] -Destination (Join-Path $bd $pair[1]) -Force -ErrorAction Stop }
+                catch { Write-Host "note: could not refresh $($pair[1]): $($_.Exception.Message)" }
+            }
+            Write-Host "patched: $bound (+ cat/inf)"
+        } catch {
+            Write-Host "note: in-place DriverStore overwrite blocked ($($_.Exception.Message))"
+            Write-Host "      the staged package (higher DriverVer) will take over on reconnect"
+        }
+    } else {
+        Write-Host 'note: could not resolve the bound DriverStore copy; staged package only'
     }
 
-    & pnputil.exe /add-driver (Join-Path $OutDir 'AltA2DP.inf') /install
+    # 5. keep the Program Files copy in sync (harmless, and some tools read it)
+    $pf = 'C:\Program Files\Luculent Systems\AltA2DP\Driver\AltA2DP.sys'
+    if (Test-Path -LiteralPath $pf) {
+        if (-not (Test-Path -LiteralPath "$pf.orig")) {
+            Copy-Item -LiteralPath $pf -Destination "$pf.orig" -Force -ErrorAction SilentlyContinue
+        }
+        Copy-Item -LiteralPath $patched -Destination $pf -Force -ErrorAction SilentlyContinue
+    }
+
+    # 6. force the bound A2DP node to re-evaluate its driver
+    & pnputil.exe /scan-devices | Out-Null
+    $dev = Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match '0000110B-0000-1000-8000-00805F9B34FB' -and $_.Status -eq 'OK' }
+    foreach ($d in $dev) {
+        try {
+            Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction Stop
+            Enable-PnpDevice  -InstanceId $d.InstanceId -Confirm:$false -ErrorAction Stop
+            Write-Host "rebound: $($d.InstanceId)"
+        } catch {
+            Write-Host "note: could not cycle $($d.InstanceId): $($_.Exception.Message)"
+        }
+    }
+
     if (-not $KeepTestsigning) {
         & bcdedit.exe /set testsigning on | Out-Null
         Write-Host 'test-signing: on'
     }
-    Write-Host 'installed - reboot required'
+    Write-Host 'installed - reboot recommended'
 }
 
 exit 0
